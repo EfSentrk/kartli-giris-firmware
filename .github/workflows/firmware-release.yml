@@ -1,0 +1,70 @@
+name: firmware-release
+
+# Firmware degisince derler, bir GitHub Release'e firmware.bin + manifest.json
+# yayinlar. Cihazlar bu release'i /releases/latest/download uzerinden ceker.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kartli_giris/**"
+      - ".github/workflows/firmware-release.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # gh release create icin gerekli
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: arduino-cli kur
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: ESP8266 core + kutuphaneler
+        run: |
+          arduino-cli config init --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp8266:esp8266@3.1.2
+          arduino-cli lib install "MFRC522@1.4.12"
+          arduino-cli lib install "LiquidCrystal I2C@1.1.2"
+
+      - name: Derle
+        run: |
+          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 \
+            --output-dir build kartli_giris
+
+      - name: Surum, binary ve manifest
+        id: meta
+        run: |
+          VERSION=$(grep -oP '#define FIRMWARE_VERSION "\K[^"]+' kartli_giris/kartli_giris.ino)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cp build/kartli_giris.ino.bin firmware.bin
+          SHA=$(sha256sum firmware.bin | cut -d' ' -f1)
+          printf '{"version":"%s","sha256":"%s"}\n' "$VERSION" "$SHA" > manifest.json
+          echo "Surum: $VERSION  SHA: $SHA"
+
+      - name: Ayni surum zaten yayinlanmis mi
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.meta.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.meta.outputs.version }} zaten var, atlaniyor."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release yayinla
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.meta.outputs.version }}" \
+            firmware.bin manifest.json \
+            --title "v${{ steps.meta.outputs.version }}" \
+            --notes "Otomatik firmware derlemesi (FIRMWARE_VERSION=${{ steps.meta.outputs.version }})"

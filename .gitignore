@@ -1,0 +1,4 @@
+build/
+*.bin
+*.elf
+kartli_giris/secrets.h
