@@ -12,7 +12,7 @@
 //   - Kayit (bootstrap sir) -> cihaz sirri EEPROM'a
 //   - RC522 kart okuma -> HMAC-SHA256 imzali /api/devices/scan
 //   - 16x2 I2C LCD'de sonuc
-//   - 30 sn'de bir heartbeat + panel komut kuyrugu (CHECK_UPDATE)
+//   - Heartbeat + panel komut kuyrugu (CHECK_UPDATE); araliklar sunucudan
 //   - GitHub'dan OTA: surum kontrol -> indir -> kendini flashla
 //
 // -----------------------------------------------------------------------------
@@ -31,10 +31,14 @@
 //   internetteki panel:  SETUP EvWifi|sifre123|panel.ornek.com|443|<SIR>
 //   yerel gelistirme  :  SETUP EvWifi|sifre123|192.168.1.157|3000|<SIR>
 //
+//   Yedek aglar (4 slota kadar) — internet giderse cihaz kendiliginden gecer:
+//     WIFI ADD <ssid>|<sifre>     WIFI DEL <1..4>     WIFI LIST
+//
 //   Diger komutlar:  INFO (ayarlari goster)  RESET (config sil)  OTA (guncelle)
 // =============================================================================
 
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
 #include <WiFiClientSecure.h>
@@ -47,7 +51,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.5.0"
+#define FIRMWARE_VERSION "0.7.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -66,24 +70,33 @@ static const unsigned long WIFI_TIMEOUT_MS    = 30000UL;
 static const unsigned long REGISTER_RETRY_MS  = 15000UL;
 static const unsigned long SAME_CARD_BLOCK_MS = 3000UL;
 static const unsigned long RESULT_HOLD_MS     = 4000UL;
-// GitHub'a push edilen bir surumun cihaza ulasma gecikmesi bu araliktir.
-// 6 saat "push atinca guncellendi" hissi vermiyordu; manifest.json 96 byte,
-// 10 dakikada bir cekmek ne GitHub'i ne cihazi zorluyor.
-static const unsigned long OTA_CHECK_MS       = 10UL * 60UL * 1000UL;   // 10 dakika
-// Panelin cihazi "cevrimici" gostermesi ve birakilan komutlarin teslim
-// alinmasi bu araliga bagli. 30 saniye, panelden basilan dugmenin makul
-// surede karsilik vermesi icin yeterince sik.
-static const unsigned long HEARTBEAT_MS       = 30UL * 1000UL;
+// Asagidaki iki aralik SABIT DEGIL: sunucu her heartbeat cevabinda gecerli
+// degerleri gonderiyor ve cihaz bunlari yaziyor. Boylece "daha seyrek ugra"
+// demek icin cihazi USB'ye takip yeniden yuklemek gerekmiyor. Buradakiler
+// yalnizca sunucuya ilk kez ulasana kadar gecerli acilis degerleri.
+static unsigned long otaCheckMs  = 10UL * 60UL * 1000UL;   // 10 dakika
+static unsigned long heartbeatMs = 60UL * 1000UL;          // 1 dakika
 
 // -----------------------------------------------------------------------------
 // EEPROM config
 // -----------------------------------------------------------------------------
-static const uint8_t CFG_MAGIC[4] = { 'K', 'G', 'C', 2 };
+// Surum 3: tek WiFi yerine 4 slotluk ag listesi. Eski config'ler gecersiz
+// sayilir (magic tutmaz) ve cihaz yeniden kurulum ister; alan duzeni degistigi
+// icin eski baytlari okumak cop deger uretirdi.
+static const uint8_t CFG_MAGIC[4] = { 'K', 'G', 'C', 3 };
+
+// Dort ag pratikte yetiyor: kurulum yeri, yedek hat, telefon hotspot'u ve
+// servis icin bir tane. Daha fazlasi EEPROM'dan cok tarama suresini uzatir.
+static const uint8_t WIFI_SLOTS = 4;
+
+struct WifiNet {
+  char ssid[33];
+  char pass[65];
+};
 
 struct Config {
   uint8_t  magic[4];
-  char     wifiSsid[33];
-  char     wifiPass[65];
+  WifiNet  nets[WIFI_SLOTS];
   char     serverHost[41];
   uint16_t serverPort;
   char     bootstrap[65];
@@ -92,10 +105,17 @@ struct Config {
 
 static Config cfg;
 static const int EEPROM_SIZE = sizeof(Config) + 8;
+static ESP8266WiFiMulti wifiMulti;
 
 bool cfgValid() {
   for (int i = 0; i < 4; i++) if (cfg.magic[i] != CFG_MAGIC[i]) return false;
   return true;
+}
+
+uint8_t wifiCount() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) if (strlen(cfg.nets[i].ssid)) n++;
+  return n;
 }
 
 void cfgLoad() { EEPROM.get(0, cfg); }
@@ -177,6 +197,19 @@ String jsonString(const String &body, const char *key) {
   return e < 0 ? "" : body.substring(s, e);
 }
 
+// jsonString tirnakli degerler icin; sayilar tirnaksiz geldiginden ayri.
+long jsonNumber(const String &body, const char *key, long fallback) {
+  String needle = String("\"") + key + "\":";
+  int i = body.indexOf(needle);
+  if (i < 0) return fallback;
+  i += needle.length();
+  while (i < (int)body.length() && body[i] == ' ') i++;
+  int j = i;
+  while (j < (int)body.length() && (isdigit(body[j]) || body[j] == '-')) j++;
+  if (j == i) return fallback;
+  return body.substring(i, j).toInt();
+}
+
 String makeNonce() {
   uint8_t b[12];
   for (int i = 0; i < 12; i += 4) { uint32_t r = RANDOM_REG32; memcpy(b + i, &r, 4); }
@@ -208,9 +241,18 @@ void lcdIdle() { lcdShow("Kart okutun", ""); idleShown = true; }
 // -----------------------------------------------------------------------------
 void printInfo() {
   Serial.println("--- config ---");
-  Serial.print("  SSID   : "); Serial.println(cfg.wifiSsid);
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    Serial.print("  wifi "); Serial.print(i + 1); Serial.print("  : ");
+    if (strlen(cfg.nets[i].ssid)) {
+      Serial.print(cfg.nets[i].ssid);
+      Serial.println(strlen(cfg.nets[i].pass) ? "  (sifreli)" : "  (acik)");
+    } else {
+      Serial.println("(bos)");
+    }
+  }
+  Serial.print("  bagli  : ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("(degil)"));
   Serial.print("  host   : "); Serial.print(cfg.serverHost); Serial.print(":"); Serial.println(cfg.serverPort);
-  Serial.print("  sifre  : "); Serial.println(strlen(cfg.wifiPass) ? "(dolu)" : "(bos)");
   Serial.print("  boot   : "); Serial.println(strlen(cfg.bootstrap) ? "(dolu)" : "(bos)");
   Serial.print("  sir    : "); Serial.println(strlen(cfg.secret) ? "(EEPROM'da var)" : "(yok - kayit gerekli)");
   Serial.print("  cihaz  : "); Serial.println(deviceId());
@@ -234,9 +276,11 @@ bool applySetup(const String &line) {
   String port = rest.substring(p3 + 1, p4);
   String boot = rest.substring(p4 + 1);
 
+  // SETUP tam sifirlama: eski aglar ve cihaz sirri da silinir. Sadece ag
+  // eklemek icin WIFI ADD var.
   memset(&cfg, 0, sizeof(cfg));
-  ssid.toCharArray(cfg.wifiSsid, sizeof(cfg.wifiSsid));
-  pass.toCharArray(cfg.wifiPass, sizeof(cfg.wifiPass));
+  ssid.toCharArray(cfg.nets[0].ssid, sizeof(cfg.nets[0].ssid));
+  pass.toCharArray(cfg.nets[0].pass, sizeof(cfg.nets[0].pass));
   host.toCharArray(cfg.serverHost, sizeof(cfg.serverHost));
   cfg.serverPort = (uint16_t)port.toInt();
   boot.toCharArray(cfg.bootstrap, sizeof(cfg.bootstrap));
@@ -247,6 +291,55 @@ bool applySetup(const String &line) {
   return true;
 }
 
+// "WIFI ADD ssid|sifre" — bos slota yazar, ayni SSID varsa sifresini gunceller.
+void wifiAdd(const String &arg) {
+  int p = arg.indexOf('|');
+  if (p < 0) { Serial.println("[wifi] HATA: bicim -> WIFI ADD ssid|sifre"); return; }
+  String ssid = arg.substring(0, p);
+  String pass = arg.substring(p + 1);
+  if (ssid.length() == 0) { Serial.println("[wifi] HATA: ssid bos"); return; }
+
+  int slot = -1;
+  // Once ayni SSID'yi ariyoruz: sifre degistiyse ikinci bir kayit acmak
+  // yerine mevcut olani guncellemek dogru davranis.
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    if (strcmp(cfg.nets[i].ssid, ssid.c_str()) == 0) { slot = i; break; }
+  }
+  if (slot < 0) {
+    for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+      if (strlen(cfg.nets[i].ssid) == 0) { slot = i; break; }
+    }
+  }
+  if (slot < 0) { Serial.println("[wifi] HATA: 4 slot da dolu. Once WIFI DEL <no>"); return; }
+
+  memset(&cfg.nets[slot], 0, sizeof(WifiNet));
+  ssid.toCharArray(cfg.nets[slot].ssid, sizeof(cfg.nets[slot].ssid));
+  pass.toCharArray(cfg.nets[slot].pass, sizeof(cfg.nets[slot].pass));
+  cfgSave();
+  Serial.print("[wifi] slot "); Serial.print(slot + 1); Serial.print(" = "); Serial.println(ssid);
+
+  // Su an bagli degilsek yeni ag hemen denensin; kullanici yeniden
+  // baslatmak zorunda kalmasin.
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+}
+
+void wifiDel(const String &arg) {
+  int n = arg.toInt();
+  if (n < 1 || n > WIFI_SLOTS) { Serial.println("[wifi] HATA: WIFI DEL 1..4"); return; }
+  memset(&cfg.nets[n - 1], 0, sizeof(WifiNet));
+  cfgSave();
+  Serial.print("[wifi] slot "); Serial.print(n); Serial.println(" silindi.");
+}
+
+void wifiList() {
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    Serial.print("  "); Serial.print(i + 1); Serial.print(") ");
+    Serial.println(strlen(cfg.nets[i].ssid) ? cfg.nets[i].ssid : "(bos)");
+  }
+  Serial.print("  bagli: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("(degil)"));
+}
+
 // Seri porttan gelen komutlari isler (her loop'ta cagrilir).
 void handleSerial() {
   if (!Serial.available()) return;
@@ -254,28 +347,53 @@ void handleSerial() {
   line.trim();
   if (line.length() == 0) return;
 
-  if (line.startsWith("SETUP ")) { applySetup(line); }
-  else if (line == "INFO")      { printInfo(); }
-  else if (line == "RESET")     { cfgClear(); Serial.println("[reset] Silindi. Yeniden baslat."); delay(300); ESP.restart(); }
-  else if (line == "OTA")       { checkOta(true); }
-  else { Serial.println("[?] Komutlar: SETUP ... | INFO | RESET | OTA"); }
+  if (line.startsWith("SETUP "))         { applySetup(line); }
+  else if (line.startsWith("WIFI ADD "))  { wifiAdd(line.substring(9)); }
+  else if (line.startsWith("WIFI DEL "))  { wifiDel(line.substring(9)); }
+  else if (line == "WIFI LIST")           { wifiList(); }
+  else if (line == "INFO")                { printInfo(); }
+  else if (line == "RESET")               { cfgClear(); Serial.println("[reset] Silindi. Yeniden baslat."); delay(300); ESP.restart(); }
+  else if (line == "OTA")                 { checkOta(true); }
+  else {
+    Serial.println("[?] Komutlar:");
+    Serial.println("    SETUP ssid|sifre|host|port|bootstrap   (tam kurulum, her seyi sifirlar)");
+    Serial.println("    WIFI ADD ssid|sifre | WIFI DEL 1..4 | WIFI LIST");
+    Serial.println("    INFO | RESET | OTA");
+  }
 }
 
 // -----------------------------------------------------------------------------
 // WiFi + NTP
 // -----------------------------------------------------------------------------
+// Tanimli aglardan o an GORUNEN ve sinyali en guclu olani secer. Bir ag
+// kapanirsa sonraki cagride liste yeniden taranir; boylece internet giderse
+// cihaz yedek hatta kendiliginden gecer ve OTA yolu acik kalir.
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  Serial.print("[wifi] "); Serial.println(cfg.wifiSsid);
-  lcdShow("WiFi", cfg.wifiSsid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t > WIFI_TIMEOUT_MS) { Serial.println("\n[wifi] baglanamadi"); lcdShow("WiFi HATA", "SETUP kontrol"); return; }
-    delay(400); Serial.print(".");
+
+  if (wifiCount() == 0) {
+    Serial.println("[wifi] Tanimli ag yok. WIFI ADD ssid|sifre");
+    lcdShow("WiFi tanimsiz", "WIFI ADD ...");
+    return;
   }
-  Serial.print("\n[wifi] IP: "); Serial.println(WiFi.localIP());
+
+  WiFi.mode(WIFI_STA);
+  wifiMulti.cleanAPlist();
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    if (strlen(cfg.nets[i].ssid)) wifiMulti.addAP(cfg.nets[i].ssid, cfg.nets[i].pass);
+  }
+
+  Serial.print("[wifi] "); Serial.print(wifiCount()); Serial.println(" ag deneniyor...");
+  lcdShow("WiFi araniyor", String(wifiCount()) + " ag");
+
+  if (wifiMulti.run(WIFI_TIMEOUT_MS) != WL_CONNECTED) {
+    Serial.println("[wifi] hicbirine baglanilamadi");
+    lcdShow("WiFi HATA", "WIFI LIST");
+    return;
+  }
+
+  Serial.print("[wifi] "); Serial.print(WiFi.SSID());
+  Serial.print("  IP: "); Serial.println(WiFi.localIP());
 }
 
 void syncTime() {
@@ -300,7 +418,9 @@ bool registerDevice() {
     "\",\"chip_id\":\"" + chipIdHex() +
     "\",\"bootstrap_secret\":\"" + cfg.bootstrap +
     "\",\"firmware_version\":\"" + FIRMWARE_VERSION +
-    "\",\"wifi_ssid\":\"" + cfg.wifiSsid +
+    // Config'teki ilk slot degil, GERCEKTEN bagli oldugumuz ag bildirilir:
+    // yedege dusuldugunde panelde hangi hattan geldigi gorunsun.
+    "\",\"wifi_ssid\":\"" + WiFi.SSID() +
     "\",\"wifi_rssi\":" + String(WiFi.RSSI()) + "}";
   int code = http.POST(payload);
   String body = http.getString();
@@ -360,6 +480,7 @@ void pollCommands() {
   lastHeartbeat = millis();
 
   String body = String("{\"firmware_version\":\"") + FIRMWARE_VERSION +
+                "\",\"wifi_ssid\":\"" + WiFi.SSID() +
                 "\",\"wifi_rssi\":" + String(WiFi.RSSI()) + "}";
   String resp;
   int code = signedPost("/api/devices/commands", body, resp);
@@ -369,6 +490,14 @@ void pollCommands() {
     if (code != 403) { Serial.print("[komut] HTTP "); Serial.println(code); }
     return;
   }
+
+  // Sunucunun bildirdigi araliklari uygula. Sinirlar cihaz tarafinda da
+  // kontrol ediliyor: bozuk ya da kotu niyetli bir deger cihazi saniyede bir
+  // istek atar hale getirmemeli.
+  long hb = jsonNumber(resp, "heartbeat_seconds", 0);
+  if (hb >= 30 && hb <= 3600) heartbeatMs = (unsigned long)hb * 1000UL;
+  long ota = jsonNumber(resp, "ota_check_seconds", 0);
+  if (ota >= 300 && ota <= 86400) otaCheckMs = (unsigned long)ota * 1000UL;
 
   // Tek komut tipimiz var; tam bir JSON ayristiricisi yerine tipin adini
   // ariyoruz. Yeni komut tipleri eklenirse burasi gercek bir parser ister.
@@ -514,8 +643,8 @@ void loop() {
     return;
   }
 
-  if (millis() - lastHeartbeat > HEARTBEAT_MS) pollCommands();
-  if (millis() - lastOtaCheck > OTA_CHECK_MS) checkOta(false);
+  if (millis() - lastHeartbeat > heartbeatMs) pollCommands();
+  if (millis() - lastOtaCheck > otaCheckMs) checkOta(false);
 
   if (!idleShown && millis() - resultShownAt > RESULT_HOLD_MS) lcdIdle();
 
