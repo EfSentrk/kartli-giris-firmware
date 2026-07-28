@@ -54,11 +54,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.10.0"
-
-// OTA kaynagi (sir degil, public depo).
-#define OTA_OWNER "EfSentrk"
-#define OTA_REPO  "kartli-giris-firmware"
+#define FIRMWARE_VERSION "0.10.1"
 
 // --- RC522 ---
 static const uint8_t RC522_SS = 15, RC522_RST = 0;   // D8, D3
