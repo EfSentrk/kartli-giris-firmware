@@ -22,9 +22,13 @@
 //
 // -----------------------------------------------------------------------------
 // ILK KURULUM (bir kez, seri monitorde 115200):
-//   SETUP <ssid>|<sifre>|<sunucu_ip>|<port>|<bootstrap_secret>
-//   ornek:
-//   SETUP Baha efe's iPhone|sifre123|172.20.10.3|3000|<DEVICE_BOOTSTRAP_SECRET>
+//   SETUP <ssid>|<sifre>|<sunucu>|<port>|<bootstrap_secret>
+//
+//   Port 443 verilirse istekler HTTPS'e gecer; boylece cihaz ayni evde olmak
+//   zorunda kalmadan internetteki panele kaydolur. Diger portlarda duz HTTP.
+//
+//   internetteki panel:  SETUP EvWifi|sifre123|panel.ornek.com|443|<SIR>
+//   yerel gelistirme  :  SETUP EvWifi|sifre123|192.168.1.157|3000|<SIR>
 //
 //   Diger komutlar:  INFO (ayarlari goster)  RESET (config sil)  OTA (guncelle)
 // =============================================================================
@@ -34,6 +38,7 @@
 #include <ESP8266httpUpdate.h>
 #include <WiFiClientSecure.h>
 #include <EEPROM.h>
+#include <memory>
 #include <SPI.h>
 #include <Wire.h>
 #include <MFRC522.h>
@@ -41,7 +46,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.3.0"
+#define FIRMWARE_VERSION "0.4.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -60,7 +65,10 @@ static const unsigned long WIFI_TIMEOUT_MS    = 30000UL;
 static const unsigned long REGISTER_RETRY_MS  = 15000UL;
 static const unsigned long SAME_CARD_BLOCK_MS = 3000UL;
 static const unsigned long RESULT_HOLD_MS     = 4000UL;
-static const unsigned long OTA_CHECK_MS       = 6UL * 3600UL * 1000UL;  // 6 saat
+// GitHub'a push edilen bir surumun cihaza ulasma gecikmesi bu araliktir.
+// 6 saat "push atinca guncellendi" hissi vermiyordu; manifest.json 96 byte,
+// 10 dakikada bir cekmek ne GitHub'i ne cihazi zorluyor.
+static const unsigned long OTA_CHECK_MS       = 10UL * 60UL * 1000UL;   // 10 dakika
 
 // -----------------------------------------------------------------------------
 // EEPROM config
@@ -111,6 +119,41 @@ static bool idleShown = false;
 // -----------------------------------------------------------------------------
 String chipIdHex() { char b[9]; snprintf(b, sizeof(b), "%06x", ESP.getChipId()); return String(b); }
 String deviceId()  { return "esp8266-" + chipIdHex(); }
+
+// --- Sunucu adresi: yerelde duz HTTP, internette HTTPS ---
+//
+// Sema icin ayri bir config alani tutmuyoruz: port 443 ise TLS kullaniyoruz.
+// Boylece ayni SETUP satiri hem "192.168.1.157|3000" hem "panel.ornek.com|443"
+// icin calisiyor ve EEPROM duzeni degismiyor.
+bool serverIsTls() { return cfg.serverPort == 443; }
+
+String serverUrl(const char *path) {
+  String u = serverIsTls() ? "https://" : "http://";
+  u += cfg.serverHost;
+  // Varsayilan portu URL'e yazmiyoruz; bazi vekiller Host basliginda :443
+  // gorunce isteği reddediyor.
+  bool defaultPort = (serverIsTls() && cfg.serverPort == 443) ||
+                     (!serverIsTls() && cfg.serverPort == 80);
+  if (!defaultPort) { u += ":"; u += cfg.serverPort; }
+  u += path;
+  return u;
+}
+
+// Cagiran taraf donen istemciyi istegin sonuna kadar canli tutmali.
+//
+// TLS'te buffer boyutunu KUCULTMUYORUZ. OTA'da GitHub icin 1024 byte yetiyor
+// cunku o baglanti MFLN destekliyor; genel bir sunucu desteklemeyebilir ve
+// kucuk buffer'da el sikisma sessizce basarisiz olur. Varsayilan 16 KB rx
+// daha cok heap yiyor ama tek bir istek icin ESP8266'da sorun cikarmiyor.
+std::unique_ptr<WiFiClient> makeClient() {
+  if (!serverIsTls()) return std::unique_ptr<WiFiClient>(new WiFiClient());
+  auto *tls = new WiFiClientSecure();
+  // Sertifika dogrulamasi yok: cihazda kok sertifika deposu tutmak ve
+  // suresi dolunca hepsini OTA ile guncellemek gerekirdi. Govde zaten
+  // HMAC ile imzali, sunucu sahte istegi kabul etmez.
+  tls->setInsecure();
+  return std::unique_ptr<WiFiClient>(tls);
+}
 
 String toHex(const uint8_t *d, size_t n) {
   static const char *h = "0123456789abcdef";
@@ -243,9 +286,9 @@ void syncTime() {
 // Kayit
 // -----------------------------------------------------------------------------
 bool registerDevice() {
-  WiFiClient client; HTTPClient http;
-  String url = String("http://") + cfg.serverHost + ":" + cfg.serverPort + "/api/devices/register";
-  if (!http.begin(client, url)) return false;
+  auto client = makeClient(); HTTPClient http;
+  String url = serverUrl("/api/devices/register");
+  if (!http.begin(*client, url)) return false;
   http.addHeader("Content-Type", "application/json");
   String payload = String("{\"device_id\":\"") + deviceId() +
     "\",\"chip_id\":\"" + chipIdHex() +
@@ -278,15 +321,15 @@ bool registerDevice() {
 // Kart okutma -> imzali scan
 // -----------------------------------------------------------------------------
 void sendScan(const String &uid) {
-  WiFiClient client; HTTPClient http;
-  String url = String("http://") + cfg.serverHost + ":" + cfg.serverPort + "/api/devices/scan";
+  auto client = makeClient(); HTTPClient http;
+  String url = serverUrl("/api/devices/scan");
   String body = String("{\"uid\":\"") + uid + "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"}";
   String ts = String((uint32_t)time(nullptr));
   String nonce = makeNonce();
   String canonical = deviceId() + "\n" + ts + "\n" + nonce + "\n" + body;
   String sig = hmacSha256Hex(String(cfg.secret), canonical);
 
-  if (!http.begin(client, url)) return;
+  if (!http.begin(*client, url)) return;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", deviceId());
   http.addHeader("X-Timestamp", ts);
