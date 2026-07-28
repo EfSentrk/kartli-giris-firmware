@@ -13,7 +13,7 @@
 //   - RC522 kart okuma -> HMAC-SHA256 imzali /api/devices/scan
 //   - 16x2 I2C LCD'de sonuc
 //   - Heartbeat + panel komut kuyrugu (CHECK_UPDATE); araliklar sunucudan
-//   - GitHub'dan OTA: surum kontrol -> indir -> kendini flashla
+//   - OTA: hedef surumu panel belirler, binary GitHub'dan iner
 //
 // -----------------------------------------------------------------------------
 // KABLOLAMA (mevcut mimari)
@@ -51,7 +51,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.7.0"
+#define FIRMWARE_VERSION "0.8.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -138,6 +138,10 @@ static unsigned long lastUidAt = 0;
 static unsigned long resultShownAt = 0;
 static unsigned long lastOtaCheck = 0;
 static unsigned long lastHeartbeat = 0;
+// Panelin dagitilmasini istedigi surum ve binary adresi. Heartbeat cevabindan
+// dolar; bos ise sunucu henuz bir surum aktif etmemis demektir.
+static String targetVersion = "";
+static String targetUrl = "";
 static bool idleShown = false;
 
 // -----------------------------------------------------------------------------
@@ -499,6 +503,12 @@ void pollCommands() {
   long ota = jsonNumber(resp, "ota_check_seconds", 0);
   if (ota >= 300 && ota <= 86400) otaCheckMs = (unsigned long)ota * 1000UL;
 
+  // Hedef surum bilgisi. Sunucu aktif surum secmemisse alanlar hic gelmez;
+  // o durumda eski degeri korumak yerine temizliyoruz ki panelden aktif surum
+  // kaldirildiginda cihaz eski hedefi kurmaya calismasin.
+  targetVersion = jsonString(resp, "firmware_version");
+  targetUrl = jsonString(resp, "firmware_url");
+
   // Tek komut tipimiz var; tam bir JSON ayristiricisi yerine tipin adini
   // ariyoruz. Yeni komut tipleri eklenirse burasi gercek bir parser ister.
   if (resp.indexOf("CHECK_UPDATE") >= 0) {
@@ -544,44 +554,47 @@ String readCardUid() {
 // -----------------------------------------------------------------------------
 // OTA: GitHub'dan surum kontrol -> indir -> flashla
 // -----------------------------------------------------------------------------
+// Hedef surumu PANEL belirler, GitHub'in "en son"u degil.
+//
+// Fark pratikte su: en son release'e bakan bir cihaz hatali bir surum
+// yayinlandiginda geri donemez, cunku yayinlanmis tag geri alinamaz. Karar
+// panelde oldugunda "onceki surume don" tek tik. Binary yine GitHub'da duruyor.
+//
+// Hedef bilgisi heartbeat cevabindan geliyor; hic heartbeat yapilmadiysa
+// (ornegin acilistaki ilk kontrol) hedef bos olur ve guncelleme atlanir.
 void checkOta(bool forced) {
   if (WiFi.status() != WL_CONNECTED) return;
   lastOtaCheck = millis();
 
-  // GitHub public depo; sertifika dogrulamasi yapmiyoruz (setInsecure). MITM
-  // riski var ama binary GitHub'da; ilerde sertifika pinlemesi eklenebilir.
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setBufferSizes(1024, 1024);
-
-  String base = String("https://github.com/") + OTA_OWNER + "/" + OTA_REPO + "/releases/latest/download";
-
-  HTTPClient http;
-  http.begin(client, base + "/manifest.json");
-  int code = http.GET();
-  if (code != 200) {
-    Serial.print("[ota] manifest alinamadi HTTP "); Serial.println(code);
-    http.end();
-    if (forced) lcdShow("OTA", "manifest yok");
+  if (targetVersion.length() == 0 || targetUrl.length() == 0) {
+    Serial.println("[ota] Sunucu bir surum aktif etmemis, atlaniyor.");
+    if (forced) lcdShow("OTA", "aktif surum yok");
     return;
   }
-  String manifest = http.getString();
-  http.end();
 
-  String latest = jsonString(manifest, "version");
   Serial.print("[ota] yuklu="); Serial.print(FIRMWARE_VERSION);
-  Serial.print("  son="); Serial.println(latest);
+  Serial.print("  hedef="); Serial.println(targetVersion);
 
-  if (latest.length() == 0 || latest == FIRMWARE_VERSION) {
+  // Esitse is yok. Farkliysa indiriyoruz: hedef daha ESKI bir surum de
+  // olabilir, geri alma boyle calisiyor.
+  if (targetVersion == FIRMWARE_VERSION) {
     if (forced) lcdShow("OTA", "guncel");
     return;
   }
 
-  Serial.println("[ota] Yeni surum var, indiriliyor...");
-  lcdShow("Guncelleniyor", latest);
+  Serial.println("[ota] Surum farkli, indiriliyor...");
+  lcdShow("Guncelleniyor", targetVersion);
+
+  // Sertifika dogrulamasi yok; binary'nin butunlugunu ESPhttpUpdate zaten
+  // flash yazarken kontrol ediyor, uydurma bir dosya cihazi acmaz.
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setBufferSizes(1024, 1024);
 
   ESPhttpUpdate.rebootOnUpdate(true);
-  t_httpUpdate_return ret = ESPhttpUpdate.update(client, base + "/firmware.bin");
+  // GitHub asset adresi indirmeyi baska bir konuma yonlendiriyor.
+  ESPhttpUpdate.followRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret = ESPhttpUpdate.update(client, targetUrl);
   if (ret == HTTP_UPDATE_FAILED) {
     Serial.print("[ota] HATA: "); Serial.println(ESPhttpUpdate.getLastErrorString());
     lcdShow("OTA HATA", "tekrar denenecek");
