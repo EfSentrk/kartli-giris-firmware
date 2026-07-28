@@ -14,6 +14,7 @@
 //   - 16x2 I2C LCD'de sonuc
 //   - Heartbeat + panel komut kuyrugu (CHECK_UPDATE); araliklar sunucudan
 //   - OTA: hedef surumu panel belirler, binary GitHub'dan iner
+//   - WiFi listesi panelden gonderilebilir (APPLY_SETTINGS)
 //
 // -----------------------------------------------------------------------------
 // KABLOLAMA (mevcut mimari)
@@ -51,7 +52,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.8.0"
+#define FIRMWARE_VERSION "0.9.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -472,6 +473,56 @@ int signedPost(const char *path, const String &body, String &resp) {
   return code;
 }
 
+// Sunucudan gelen "wifi":[{"ssid":"..","password":".."}] listesini EEPROM'a yazar.
+//
+// Liste BOSSA hicbir sey yapmiyoruz. Aksi halde panelde ag tanimlamayi unutmus
+// biri "Karta yolla" dedigi anda cihaz butun aglarini kaybeder ve bir daha
+// baglanamaz; boyle bir hatanin bedeli cihazi sokup USB'ye takmak olur.
+void applyWifiFromJson(const String &body) {
+  int listStart = body.indexOf("\"wifi\":[");
+  if (listStart < 0) { Serial.println("[wifi] Listede ag yok, degisiklik yapilmadi."); return; }
+
+  WifiNet parsed[WIFI_SLOTS];
+  memset(parsed, 0, sizeof(parsed));
+  uint8_t count = 0;
+
+  int cursor = listStart;
+  while (count < WIFI_SLOTS) {
+    int ssidAt = body.indexOf("\"ssid\":\"", cursor);
+    if (ssidAt < 0) break;
+    int ssidEnd = body.indexOf('"', ssidAt + 8);
+    if (ssidEnd < 0) break;
+    String ssid = body.substring(ssidAt + 8, ssidEnd);
+
+    String pass = "";
+    int passAt = body.indexOf("\"password\":\"", ssidEnd);
+    // Sifre alani bir SONRAKI ssid'den once gelmeli; yoksa o ag sifresizdir.
+    int nextSsid = body.indexOf("\"ssid\":\"", ssidEnd);
+    if (passAt >= 0 && (nextSsid < 0 || passAt < nextSsid)) {
+      int passEnd = body.indexOf('"', passAt + 12);
+      if (passEnd >= 0) pass = body.substring(passAt + 12, passEnd);
+    }
+
+    if (ssid.length() > 0) {
+      ssid.toCharArray(parsed[count].ssid, sizeof(parsed[count].ssid));
+      pass.toCharArray(parsed[count].pass, sizeof(parsed[count].pass));
+      count++;
+    }
+    cursor = ssidEnd + 1;
+  }
+
+  if (count == 0) { Serial.println("[wifi] Ayristirilabilir ag yok, degisiklik yapilmadi."); return; }
+
+  memcpy(cfg.nets, parsed, sizeof(cfg.nets));
+  cfgSave();
+
+  Serial.print("[wifi] "); Serial.print(count); Serial.println(" ag panelden guncellendi:");
+  for (uint8_t i = 0; i < count; i++) { Serial.print("   - "); Serial.println(cfg.nets[i].ssid); }
+
+  // Bagli oldugumuz ag listeden cikmis olabilir; bir sonraki kopmada
+  // yeni liste zaten devreye girer, simdi baglantiyi kesmiyoruz.
+}
+
 // -----------------------------------------------------------------------------
 // Heartbeat + komut kuyrugu
 // -----------------------------------------------------------------------------
@@ -509,8 +560,14 @@ void pollCommands() {
   targetVersion = jsonString(resp, "firmware_version");
   targetUrl = jsonString(resp, "firmware_url");
 
-  // Tek komut tipimiz var; tam bir JSON ayristiricisi yerine tipin adini
-  // ariyoruz. Yeni komut tipleri eklenirse burasi gercek bir parser ister.
+  // Panelden gonderilen ag listesini uygula.
+  if (resp.indexOf("APPLY_SETTINGS") >= 0) {
+    Serial.println("[komut] APPLY_SETTINGS alindi.");
+    applyWifiFromJson(resp);
+  }
+
+  // Tam bir JSON ayristiricisi yerine komut tipinin adini ariyoruz; iki tip
+  // icin yeterli. Uctan fazla komut tipi olursa burasi gercek bir parser ister.
   if (resp.indexOf("CHECK_UPDATE") >= 0) {
     Serial.println("[komut] CHECK_UPDATE alindi, guncelleme kontrol ediliyor.");
     checkOta(true);
