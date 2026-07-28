@@ -12,6 +12,7 @@
 //   - Kayit (bootstrap sir) -> cihaz sirri EEPROM'a
 //   - RC522 kart okuma -> HMAC-SHA256 imzali /api/devices/scan
 //   - 16x2 I2C LCD'de sonuc
+//   - 30 sn'de bir heartbeat + panel komut kuyrugu (CHECK_UPDATE)
 //   - GitHub'dan OTA: surum kontrol -> indir -> kendini flashla
 //
 // -----------------------------------------------------------------------------
@@ -46,7 +47,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.4.0"
+#define FIRMWARE_VERSION "0.5.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -69,6 +70,10 @@ static const unsigned long RESULT_HOLD_MS     = 4000UL;
 // 6 saat "push atinca guncellendi" hissi vermiyordu; manifest.json 96 byte,
 // 10 dakikada bir cekmek ne GitHub'i ne cihazi zorluyor.
 static const unsigned long OTA_CHECK_MS       = 10UL * 60UL * 1000UL;   // 10 dakika
+// Panelin cihazi "cevrimici" gostermesi ve birakilan komutlarin teslim
+// alinmasi bu araliga bagli. 30 saniye, panelden basilan dugmenin makul
+// surede karsilik vermesi icin yeterince sik.
+static const unsigned long HEARTBEAT_MS       = 30UL * 1000UL;
 
 // -----------------------------------------------------------------------------
 // EEPROM config
@@ -112,6 +117,7 @@ static String lastUid = "";
 static unsigned long lastUidAt = 0;
 static unsigned long resultShownAt = 0;
 static unsigned long lastOtaCheck = 0;
+static unsigned long lastHeartbeat = 0;
 static bool idleShown = false;
 
 // -----------------------------------------------------------------------------
@@ -318,26 +324,67 @@ bool registerDevice() {
 }
 
 // -----------------------------------------------------------------------------
-// Kart okutma -> imzali scan
+// Imzali POST
 // -----------------------------------------------------------------------------
-void sendScan(const String &uid) {
+//
+// Kanonik metin sunucudaki buildCanonical ile BIREBIR ayni olmali:
+//   device_id \n timestamp \n nonce \n body
+// Govde yeniden serilestirilmeden, gonderilen ham metin imzalanir.
+int signedPost(const char *path, const String &body, String &resp) {
   auto client = makeClient(); HTTPClient http;
-  String url = serverUrl("/api/devices/scan");
-  String body = String("{\"uid\":\"") + uid + "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"}";
   String ts = String((uint32_t)time(nullptr));
   String nonce = makeNonce();
-  String canonical = deviceId() + "\n" + ts + "\n" + nonce + "\n" + body;
-  String sig = hmacSha256Hex(String(cfg.secret), canonical);
+  String sig = hmacSha256Hex(String(cfg.secret), deviceId() + "\n" + ts + "\n" + nonce + "\n" + body);
 
-  if (!http.begin(*client, url)) return;
+  if (!http.begin(*client, serverUrl(path))) return -1;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", deviceId());
   http.addHeader("X-Timestamp", ts);
   http.addHeader("X-Nonce", nonce);
   http.addHeader("X-Signature", sig);
   int code = http.POST(body);
-  String resp = http.getString();
+  resp = http.getString();
   http.end();
+  return code;
+}
+
+// -----------------------------------------------------------------------------
+// Heartbeat + komut kuyrugu
+// -----------------------------------------------------------------------------
+//
+// Cihaz kart okutulmasa da duzenli olarak sunucuya ugrar. Iki faydasi var:
+// panel "en son ne zaman gorundu" bilgisini alir, ve panelden birakilan
+// komutlari 30 saniye icinde tesliim aliriz. OTA'nin 10 dakikalik periyodunu
+// beklemeden "simdi guncelle" diyebilmemizin yolu bu.
+void pollCommands() {
+  lastHeartbeat = millis();
+
+  String body = String("{\"firmware_version\":\"") + FIRMWARE_VERSION +
+                "\",\"wifi_rssi\":" + String(WiFi.RSSI()) + "}";
+  String resp;
+  int code = signedPost("/api/devices/commands", body, resp);
+
+  if (code != 200) {
+    // Onay bekleyen cihaz 403 alir; bu bir hata degil, normal durum.
+    if (code != 403) { Serial.print("[komut] HTTP "); Serial.println(code); }
+    return;
+  }
+
+  // Tek komut tipimiz var; tam bir JSON ayristiricisi yerine tipin adini
+  // ariyoruz. Yeni komut tipleri eklenirse burasi gercek bir parser ister.
+  if (resp.indexOf("CHECK_UPDATE") >= 0) {
+    Serial.println("[komut] CHECK_UPDATE alindi, guncelleme kontrol ediliyor.");
+    checkOta(true);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Kart okutma -> imzali scan
+// -----------------------------------------------------------------------------
+void sendScan(const String &uid) {
+  String body = String("{\"uid\":\"") + uid + "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"}";
+  String resp;
+  int code = signedPost("/api/devices/scan", body, resp);
 
   if (code == 200) {
     String action = jsonString(resp, "action");
@@ -467,6 +514,7 @@ void loop() {
     return;
   }
 
+  if (millis() - lastHeartbeat > HEARTBEAT_MS) pollCommands();
   if (millis() - lastOtaCheck > OTA_CHECK_MS) checkOta(false);
 
   if (!idleShown && millis() - resultShownAt > RESULT_HOLD_MS) lcdIdle();
