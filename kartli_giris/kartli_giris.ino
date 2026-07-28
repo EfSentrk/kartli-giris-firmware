@@ -15,6 +15,7 @@
 //   - Heartbeat + panel komut kuyrugu (CHECK_UPDATE); araliklar sunucudan
 //   - OTA: hedef surumu panel belirler, binary GitHub'dan iner
 //   - WiFi listesi panelden gonderilebilir (APPLY_SETTINGS)
+//   - Internet yokken okutmalar flash'ta birikir, baglanti gelince yuklenir
 //
 // -----------------------------------------------------------------------------
 // KABLOLAMA (mevcut mimari)
@@ -44,6 +45,7 @@
 #include <ESP8266httpUpdate.h>
 #include <WiFiClientSecure.h>
 #include <EEPROM.h>
+#include <LittleFS.h>
 #include <memory>
 #include <SPI.h>
 #include <Wire.h>
@@ -52,7 +54,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.9.0"
+#define FIRMWARE_VERSION "0.10.0"
 
 // OTA kaynagi (sir degil, public depo).
 #define OTA_OWNER "EfSentrk"
@@ -215,6 +217,16 @@ long jsonNumber(const String &body, const char *key, long fallback) {
   return body.substring(i, j).toInt();
 }
 
+// epoch -> "2026-07-28T12:34:56Z". Sunucu ISO 8601 bekliyor.
+String isoFromEpoch(uint32_t epoch) {
+  time_t t = (time_t)epoch;
+  struct tm *g = gmtime(&t);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           g->tm_year + 1900, g->tm_mon + 1, g->tm_mday, g->tm_hour, g->tm_min, g->tm_sec);
+  return String(buf);
+}
+
 String makeNonce() {
   uint8_t b[12];
   for (int i = 0; i < 12; i += 4) { uint32_t r = RANDOM_REG32; memcpy(b + i, &r, 4); }
@@ -239,7 +251,13 @@ void lcdShow(const String &l1, const String &l2) {
   lcd.setCursor(0, 0); lcd.print(l1.substring(0, 16));
   lcd.setCursor(0, 1); lcd.print(l2.substring(0, 16));
 }
-void lcdIdle() { lcdShow("Kart okutun", ""); idleShown = true; }
+// Ikinci satir baglanti durumunu tasiyor: cevrimdisiyken kullanici kart
+// okutmaya devam edebilmeli ama kaydin anlik islenmedigini bilmeli.
+void lcdIdle() {
+  bool online = WiFi.status() == WL_CONNECTED;
+  lcdShow("Kart okutun", online ? "" : "Internet yok");
+  idleShown = true;
+}
 
 // -----------------------------------------------------------------------------
 // Seri kurulum komutlari
@@ -449,6 +467,153 @@ bool registerDevice() {
 }
 
 // -----------------------------------------------------------------------------
+// Cevrimdisi tampon
+// -----------------------------------------------------------------------------
+//
+// Internet yokken okutmalar flash'a yaziliyor, baglanti gelince topluca
+// gonderiliyor. Cihaz GIRIS mi CIKIS mi oldugunu KENDI karar vermiyor: ham
+// okutmayi saklayip karari sunucuya birakiyor. Aksi halde cevrimdisi verilen
+// kararlarla sunucudaki gecmis catisirdi.
+//
+// Satir bicimi:  <kimlik>,<epoch>,<millis>,<uid>
+// epoch 0 ise okutma aninda saat kurulu degildi; o kayit gonderilirken
+// millis farkindan geriye hesaplaniyor.
+static const char *BUFFER_PATH = "/scans.csv";
+// Flash'i doldurmamak icin ust sinir. Asildiginda EN ESKI kayitlar yerine
+// yenileri yazilmiyor: eski kayitlar zaten olmus olaylar, yeni okutma
+// kullanicinin tekrar deneyebilecegi bir sey.
+static const size_t BUFFER_MAX_BYTES = 32768;
+static bool fsReady = false;
+
+// Her acilista degisen kimlik. Yeniden baslatma sonrasi millis sifirlandigi
+// icin, onceki oturumdan kalan kayitlarin zamani millis ile hesaplanamaz.
+static uint32_t bootId = 0;
+
+void bufferInit() {
+  fsReady = LittleFS.begin();
+  if (!fsReady) {
+    // Fabrikadan cikan kartta dosya sistemi bicimlendirilmemis olur; ilk
+    // acilista bir kez bicimlendiriyoruz.
+    Serial.println("[tampon] Dosya sistemi bicimlendiriliyor...");
+    fsReady = LittleFS.format() && LittleFS.begin();
+  }
+  if (!fsReady) {
+    Serial.println("[tampon] LittleFS acilamadi; cevrimdisi kayit yapilamaz.");
+    return;
+  }
+  bootId = RANDOM_REG32;
+  File f = LittleFS.open(BUFFER_PATH, "r");
+  if (f) { Serial.print("[tampon] "); Serial.print(f.size()); Serial.println(" byte bekliyor."); f.close(); }
+}
+
+void bufferAppend(const String &uid) {
+  if (!fsReady) return;
+
+  File check = LittleFS.open(BUFFER_PATH, "r");
+  size_t size = check ? check.size() : 0;
+  if (check) check.close();
+  if (size > BUFFER_MAX_BYTES) {
+    Serial.println("[tampon] Dolu, kayit atlandi.");
+    lcdShow("Hafiza dolu", "Yetkiliye bildir");
+    return;
+  }
+
+  uint32_t now = (uint32_t)time(nullptr);
+  // 1.6 milyar oncesi bir deger saatin hic kurulmadigini gosterir.
+  if (now < 1600000000UL) now = 0;
+
+  File f = LittleFS.open(BUFFER_PATH, "a");
+  if (!f) { Serial.println("[tampon] Dosya acilamadi."); return; }
+  f.print(bootId, HEX); f.print("-"); f.print(millis(), HEX); f.print(",");
+  f.print(now); f.print(","); f.print(millis()); f.print(","); f.println(uid);
+  f.close();
+
+  Serial.print("[tampon] Kaydedildi: "); Serial.println(uid);
+}
+
+/**
+ * Tamponu sunucuya yukler.
+ *
+ * Yukleme basarili olursa dosya siliniyor. Kismen basarili olursa dosyayi
+ * OLDUGU GIBI birakiyoruz: sunucu ayni kimligi ikinci kez yok sayacagi icin
+ * tekrar gondermek zarar vermez, ama kaybetmek geri alinamaz.
+ */
+// Her loop turunda cagriliyor ama isi seyrek yapiyor: dosyayi saniyede
+// binlerce kez acmak flash'i bosuna yorar ve kart okumayi yavaslatir.
+static const unsigned long FLUSH_INTERVAL_MS = 15000UL;
+
+void bufferFlush() {
+  static unsigned long lastFlush = 0;
+  if (!fsReady || WiFi.status() != WL_CONNECTED || strlen(cfg.secret) == 0) return;
+  if (millis() - lastFlush < FLUSH_INTERVAL_MS) return;
+  lastFlush = millis();
+
+  if (!LittleFS.exists(BUFFER_PATH)) return;
+
+  File f = LittleFS.open(BUFFER_PATH, "r");
+  if (!f) return;
+  if (f.size() == 0) { f.close(); LittleFS.remove(BUFFER_PATH); return; }
+
+  Serial.println("[tampon] Yukleniyor...");
+  lcdShow("Kayitlar", "yukleniyor...");
+
+  uint32_t nowEpoch = (uint32_t)time(nullptr);
+  String json = "{\"events\":[";
+  uint16_t count = 0;
+
+  while (f.available() && count < 50) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int c1 = line.indexOf(','), c2 = line.indexOf(',', c1 + 1), c3 = line.indexOf(',', c2 + 1);
+    if (c1 < 0 || c2 < 0 || c3 < 0) continue;
+
+    String id = line.substring(0, c1);
+    uint32_t epoch = (uint32_t)line.substring(c1 + 1, c2).toInt();
+    unsigned long at = (unsigned long)line.substring(c2 + 1, c3).toInt();
+    String uid = line.substring(c3 + 1);
+
+    // Saat okutma aninda kuruluysa onu kullaniyoruz. Degilse ve kayit BU
+    // oturumdansa millis farkindan geriye hesapliyoruz. Ikisi de yoksa zaman
+    // gondermiyoruz; sunucu varis anini kullanir ve bunu bilerek kabul
+    // ediyoruz: yaklasik bir zaman, hic kayit olmamasindan iyidir.
+    String timeField = "";
+    if (epoch > 0) {
+      timeField = String(",\"event_time\":\"") + isoFromEpoch(epoch) + "\"";
+    } else if (id.startsWith(String(bootId, HEX) + "-") && nowEpoch > 1600000000UL) {
+      uint32_t back = (uint32_t)((millis() - at) / 1000UL);
+      timeField = String(",\"event_time\":\"") + isoFromEpoch(nowEpoch - back) + "\"";
+    }
+
+    if (count > 0) json += ",";
+    json += "{\"uid\":\"" + uid + "\",\"event_id\":\"" + id +
+            "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"" + timeField + "}";
+    count++;
+  }
+  bool more = f.available();
+  f.close();
+
+  if (count == 0) { LittleFS.remove(BUFFER_PATH); return; }
+  json += "]}";
+
+  String resp;
+  int code = signedPost("/api/devices/scan/batch", json, resp);
+
+  if (code == 200) {
+    Serial.print("[tampon] "); Serial.print(count); Serial.println(" kayit yuklendi.");
+    // Bu turda gonderilenler dosyanin basindaydi; hepsi kabul edildiyse
+    // dosyayi silip kalanlari bir sonraki turda gonderiyoruz.
+    LittleFS.remove(BUFFER_PATH);
+    if (more) Serial.println("[tampon] Kalan kayitlar sonraki turda.");
+    lcdShow("Kayitlar", "yuklendi");
+  } else {
+    Serial.print("[tampon] Yukleme basarisiz HTTP "); Serial.println(code);
+  }
+  resultShownAt = millis(); idleShown = false;
+}
+
+// -----------------------------------------------------------------------------
 // Imzali POST
 // -----------------------------------------------------------------------------
 //
@@ -578,6 +743,14 @@ void pollCommands() {
 // Kart okutma -> imzali scan
 // -----------------------------------------------------------------------------
 void sendScan(const String &uid) {
+  // Internet yokken sunucuya sormanin anlami yok: dogrudan tampona.
+  if (WiFi.status() != WL_CONNECTED) {
+    bufferAppend(uid);
+    lcdShow("Kaydedildi", "Internet yok");
+    resultShownAt = millis(); idleShown = false;
+    return;
+  }
+
   String body = String("{\"uid\":\"") + uid + "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"}";
   String resp;
   int code = signedPost("/api/devices/scan", body, resp);
@@ -591,7 +764,18 @@ void sendScan(const String &uid) {
     lcdShow(message, staff.length() ? staff : action);
   } else if (code == 403) { lcdShow("Onay bekliyor", "Panelden onayla"); Serial.println("[scan] 403 onay bekliyor"); }
   else if (code == 401)   { lcdShow("Imza hatasi", "Saat/sir?"); Serial.println("[scan] 401 imza"); }
-  else { lcdShow("Sunucu hatasi", String("HTTP ") + code); Serial.print("[scan] HTTP "); Serial.println(code); }
+  else {
+    // Sunucuya ulasilamadi (kopuk hat, DNS, zaman asimi). Kayit kaybolmasin:
+    // tampona alip baglanti duzelince yolluyoruz. 401/403 bunun disinda
+    // tutuluyor cunku onlar tekrar denemekle duzelmez.
+    if (code < 0 || code >= 500) {
+      bufferAppend(uid);
+      lcdShow("Kaydedildi", "Sunucu yok");
+    } else {
+      lcdShow("Sunucu hatasi", String("HTTP ") + code);
+    }
+    Serial.print("[scan] HTTP "); Serial.println(code);
+  }
 
   resultShownAt = millis(); idleShown = false;
 }
@@ -677,6 +861,7 @@ void setup() {
 
   SPI.begin();
   rfid.PCD_Init();
+  bufferInit();
 
   if (!cfgValid()) {
     Serial.println("[setup] Config yok. Seri porttan kurulum yap:");
@@ -712,6 +897,10 @@ void loop() {
     if (millis() - lastRegister > REGISTER_RETRY_MS) { lastRegister = millis(); registerDevice(); }
     return;
   }
+
+  // Once birikmis kayitlar: heartbeat'ten once bosaltmak, panelde
+  // cihazin cevrimici gorunmesiyle kayitlarin gelmesi arasindaki farki kapatir.
+  bufferFlush();
 
   if (millis() - lastHeartbeat > heartbeatMs) pollCommands();
   if (millis() - lastOtaCheck > otaCheckMs) checkOta(false);
