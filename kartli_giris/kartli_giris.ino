@@ -54,7 +54,25 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.10.1"
+#define FIRMWARE_VERSION "0.11.0"
+
+// =============================================================================
+// FABRIKA AYARLARI  (opsiyonel)
+// =============================================================================
+//
+// Bu blok BOS oldugunda cihaz acilista SETUP bekler ve yayinlanan .bin sirsiz
+// kalir. Panel "Kurulum" bolumunde doldurulmus bir kopya uretir; o kopyayi
+// yukleyen cihaz seri porta hic dokunmadan kendini kaydeder.
+//
+// DOLDURULMUS KOPYAYI DEPOYA COMMIT ETME: icinde WiFi sifreleri ve kayit sirri
+// bulunur. Ayni sebeple ondan derlenen .bin de herkese acik paylasilmamali.
+//
+// Aglar "ssid|sifre;ssid|sifre" bicimindedir; bu yuzden ne ag adi ne sifre
+// '|' veya ';' icerebilir (panel bunu zaten engelliyor).
+#define PROVISION_WIFI   ""
+#define PROVISION_HOST   ""
+#define PROVISION_PORT   443
+#define PROVISION_SECRET ""
 
 // --- RC522 ---
 static const uint8_t RC522_SS = 15, RC522_RST = 0;   // D8, D3
@@ -357,6 +375,39 @@ void wifiList() {
   }
   Serial.print("  bagli: ");
   Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String("(degil)"));
+}
+
+// Derleme aninda gomulu fabrika ayarlarini EEPROM'a yazar.
+void applyProvisioning() {
+  memset(&cfg, 0, sizeof(cfg));
+
+  String list = PROVISION_WIFI;
+  uint8_t slot = 0;
+  int start = 0;
+  while (slot < WIFI_SLOTS && start < (int)list.length()) {
+    int sep = list.indexOf(';', start);
+    String pair = sep < 0 ? list.substring(start) : list.substring(start, sep);
+    int bar = pair.indexOf('|');
+    String ssid = bar < 0 ? pair : pair.substring(0, bar);
+    String pass = bar < 0 ? "" : pair.substring(bar + 1);
+    ssid.trim();
+    if (ssid.length() > 0) {
+      ssid.toCharArray(cfg.nets[slot].ssid, sizeof(cfg.nets[slot].ssid));
+      pass.toCharArray(cfg.nets[slot].pass, sizeof(cfg.nets[slot].pass));
+      slot++;
+    }
+    if (sep < 0) break;
+    start = sep + 1;
+  }
+
+  String(PROVISION_HOST).toCharArray(cfg.serverHost, sizeof(cfg.serverHost));
+  cfg.serverPort = PROVISION_PORT;
+  String(PROVISION_SECRET).toCharArray(cfg.bootstrap, sizeof(cfg.bootstrap));
+  cfgSave();
+
+  Serial.print("[setup] Fabrika ayarlari uygulandi: ");
+  Serial.print(slot); Serial.print(" ag, host "); Serial.println(cfg.serverHost);
+  lcdShow("Kurulum", "yapiliyor...");
 }
 
 // Seri porttan gelen komutlari isler (her loop'ta cagrilir).
@@ -858,6 +909,14 @@ void setup() {
   SPI.begin();
   rfid.PCD_Init();
   bufferInit();
+
+  // Fabrika ayarlari doluysa ve cihazda henuz config yoksa, kurulumu
+  // kendiliginden yapiyoruz. Var olan config'i EZMIYORUZ: sahada SETUP ya da
+  // panelden gonderilen ag listesiyle degistirilmis ayarlar, eski bir fabrika
+  // degerine geri donmemeli.
+  if (!cfgValid() && strlen(PROVISION_HOST) > 0 && strlen(PROVISION_WIFI) > 0) {
+    applyProvisioning();
+  }
 
   if (!cfgValid()) {
     Serial.println("[setup] Config yok. Seri porttan kurulum yap:");
