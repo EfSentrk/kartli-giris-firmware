@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.18.0"
+#define FIRMWARE_VERSION "0.18.1"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -1006,7 +1006,8 @@ void checkOta(bool forced) {
     return;
   }
 
-  Serial.println("[ota] Surum farkli, indiriliyor...");
+  Serial.print("[ota] Surum farkli, indiriliyor: ");
+  Serial.println(targetUrl);
   lcdShow("Guncelleniyor", targetVersion);
 
   // Sertifika dogrulamasi yok; binary'nin butunlugunu ESPhttpUpdate zaten
