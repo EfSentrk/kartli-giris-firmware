@@ -21,7 +21,7 @@
 // KABLOLAMA (mevcut mimari)
 //   RC522: SDA/SS->D8(GPIO15) SCK->D5 MOSI->D7 MISO->D6 RST->D3(GPIO0) 3.3V GND
 //   LCD  : SDA->D2(GPIO4) SCL->D1(GPIO5) VCC->5V(VIN) GND  (16x2)
-//   LCD adresi acilista taranir (0x27 / 0x3F); sabit degildir.
+//   LCD adresi: PROVISION_LCD_ADDR ile secilir, 0 ise otomatik taranir.
 //   NOT: D8->GND 10k pull-down, D3->3V3 10k pull-up (acilis stabilitesi).
 //
 // -----------------------------------------------------------------------------
@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.14.0"
+#define FIRMWARE_VERSION "0.15.0"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -74,6 +74,11 @@
 #define PROVISION_HOST   ""
 #define PROVISION_PORT   443
 #define PROVISION_SECRET ""
+
+// LCD I2C adresi. 0 = otomatik tara (0x20..0x27 ve 0x38..0x3F).
+// Modulun adresini biliyorsan yazmak taramayi atlatir ve acilisi hizlandirir;
+// bilmiyorsan 0 birak, cihaz kendi bulur ve seri porta yazar.
+#define PROVISION_LCD_ADDR 0
 
 // --- RC522 ---
 static const uint8_t RC522_SS = 15, RC522_RST = 0;   // D8, D3
@@ -297,6 +302,19 @@ uint8_t findLcdAddress() {
   Wire.begin(LCD_SDA, LCD_SCL);
   // Uzun/kotu kablolarda 100 kHz, varsayilan 400 kHz'den daha toleransli.
   Wire.setClock(100000);
+
+  // Adres elle verilmisse once onu deniyoruz. Cevap vermezse taramaya
+  // devam ediyoruz: yanlis bir secim yuzunden ekranin tumden kaybolmasi,
+  // birkac milisaniyelik taramadan daha kotu.
+  if (PROVISION_LCD_ADDR != 0) {
+    Wire.beginTransmission((uint8_t)PROVISION_LCD_ADDR);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("[lcd] Secilen adres 0x"); Serial.println(PROVISION_LCD_ADDR, HEX);
+      return (uint8_t)PROVISION_LCD_ADDR;
+    }
+    Serial.print("[lcd] Secilen adres 0x"); Serial.print(PROVISION_LCD_ADDR, HEX);
+    Serial.println(" cevap vermedi, taraniyor.");
+  }
 
   // LCD arka yuzeyleri iki cip ailesinden birini kullanir:
   //   PCF8574  -> 0x20..0x27
