@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.12.0"
+#define FIRMWARE_VERSION "0.12.1"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -634,6 +634,35 @@ void bufferAppend(const String &uid) {
 // binlerce kez acmak flash'i bosuna yorar ve kart okumayi yavaslatir.
 static const unsigned long FLUSH_INTERVAL_MS = 15000UL;
 
+// Tamponun basindaki `sent` satiri atar, kalani korur.
+//
+// LittleFS'te dosyanin basindan silme yok; kalani gecici dosyaya yazip yer
+// degistiriyoruz. Once gecici dosyayi tamamlayip sonra asili silmemizin
+// sebebi, bu sirada elektrik giderse kayitlarin durmasi.
+void dropSentLines(uint16_t sent) {
+  File src = LittleFS.open(BUFFER_PATH, "r");
+  if (!src) return;
+
+  for (uint16_t i = 0; i < sent && src.available(); i++) src.readStringUntil('\n');
+
+  if (!src.available()) { src.close(); LittleFS.remove(BUFFER_PATH); return; }
+
+  File tmp = LittleFS.open("/scans.tmp", "w");
+  if (!tmp) { src.close(); return; }
+
+  while (src.available()) {
+    String line = src.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) tmp.println(line);
+  }
+  src.close();
+  tmp.close();
+
+  LittleFS.remove(BUFFER_PATH);
+  LittleFS.rename("/scans.tmp", BUFFER_PATH);
+  Serial.println("[tampon] Kalan kayitlar korundu, sonraki turda gonderilecek.");
+}
+
 void bufferFlush() {
   static unsigned long lastFlush = 0;
   if (!fsReady || WiFi.status() != WL_CONNECTED || strlen(cfg.secret) == 0) return;
@@ -683,7 +712,6 @@ void bufferFlush() {
             "\",\"firmware_version\":\"" + FIRMWARE_VERSION + "\"" + timeField + "}";
     count++;
   }
-  bool more = f.available();
   f.close();
 
   if (count == 0) { LittleFS.remove(BUFFER_PATH); return; }
@@ -694,10 +722,10 @@ void bufferFlush() {
 
   if (code == 200) {
     Serial.print("[tampon] "); Serial.print(count); Serial.println(" kayit yuklendi.");
-    // Bu turda gonderilenler dosyanin basindaydi; hepsi kabul edildiyse
-    // dosyayi silip kalanlari bir sonraki turda gonderiyoruz.
-    LittleFS.remove(BUFFER_PATH);
-    if (more) Serial.println("[tampon] Kalan kayitlar sonraki turda.");
+    // Yalnizca GONDERILEN satirlari dusuyoruz. Dosyanin tamamini silmek,
+    // 50'den fazla kayit birikmisse gonderilmeyenleri de yok ederdi; uzun bir
+    // kesintiden sonra tam da en cok kayit varken vuran bir hata olurdu.
+    dropSentLines(count);
     lcdShow("Kayitlar", "yuklendi");
   } else {
     Serial.print("[tampon] Yukleme basarisiz HTTP "); Serial.println(code);
