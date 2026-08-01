@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.17.0"
+#define FIRMWARE_VERSION "0.17.1"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)

@@ -34,13 +34,12 @@ jobs:
 
       - name: Derle
         run: |
-          # eesz=4M1M: dosya sistemi 1MB, sketch bolgesi 2MB. Varsayilan
-          # 4M2M'de sketch bolgesi 1MB oldugu icin OTA tavani ~512KB'a
-          # dusuyordu (guncelleme, yeni imaji bos alana kopyaladigi icin
-          # bolgenin yarisindan fazlasini kullanamiyor). Cihazlar da ayni
-          # bolumlemeyle yuklenmeli; imaj basligindaki flash duzeni tutmazsa
-          # dosya sistemi yanlis adrese denk gelir.
-          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:eesz=4M1M \
+          # Varsayilan flash duzeni (4M2M) kullaniliyor. FS'i kucultmek OTA
+          # tavanini BUYUTMUYOR: ESP8266 flash'in yalnizca ilk ~1MB'ini kod
+          # olarak esleyebildigi icin sketch tavani her duzende ~1019KB.
+          # Duzeni degistirmek cihazlarin EEPROM'unu ve dosya sistemini
+          # tasidigi icin bedeli var, karsiligi yok.
+          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 \
             --output-dir build kartli_giris
 
       - name: Surum, binary ve manifest
