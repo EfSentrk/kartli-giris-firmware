@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.18.2"
+#define FIRMWARE_VERSION "0.18.3"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -70,10 +70,10 @@
 //
 // Aglar "ssid|sifre;ssid|sifre" bicimindedir; bu yuzden ne ag adi ne sifre
 // '|' veya ';' icerebilir (panel bunu zaten engelliyor).
-#define PROVISION_WIFI   ""
-#define PROVISION_HOST   ""
-#define PROVISION_PORT   443
-#define PROVISION_SECRET ""
+#define PROVISION_WIFI "Superbox_WiFi_D8AF|L78NBHF0LN6;TIEE Ar-Ge|Engin3725."
+#define PROVISION_HOST "kartl-giris.vercel.app"
+#define PROVISION_PORT 443
+#define PROVISION_SECRET "M8k5ylPLZOEWxHqk34Gkqd8Z1cf/G9hsC1z2vkyIHS8="
 
 // LCD I2C adresi. 0 = otomatik tara (0x20..0x27 ve 0x38..0x3F).
 // Modulun adresini biliyorsan yazmak taramayi atlatir ve acilisi hizlandirir;
@@ -1021,6 +1021,24 @@ void checkOta(bool forced) {
   // ve calisiyor; OTA'nin ondan farkli olmasi icin bir sebep yok.
   WiFiClientSecure client;
   client.setInsecure();
+
+  // Indirme ilerlemesini ekrana yaz. Guncelleme 20-30 saniye surdugu icin
+  // ekranin donuk kalmasi cihazin kilitlendigi izlenimi veriyordu; yuzde
+  // gorunmesi hem kullaniciyi hem bizi rahatlatiyor.
+  //
+  // Her pakette degil, yalnizca yuzde degistiginde yaziyoruz: I2C yazmasi
+  // yavas ve indirme dongusunu geciktiriyor.
+  ESPhttpUpdate.onProgress([](int done, int total) {
+    static int lastPct = -1;
+    if (total <= 0) return;
+    int pct = (int)((done * 100L) / total);
+    if (pct == lastPct) return;
+    lastPct = pct;
+    if (pct % 10 == 0) {
+      Serial.print("[ota] %"); Serial.println(pct);
+      lcdShow("Guncelleniyor", targetVersion + "  %" + String(pct));
+    }
+  });
 
   ESPhttpUpdate.rebootOnUpdate(true);
   // GitHub asset adresi indirmeyi baska bir konuma yonlendiriyor.
