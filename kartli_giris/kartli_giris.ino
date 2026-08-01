@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.12.1"
+#define FIRMWARE_VERSION "0.12.2"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -269,33 +269,34 @@ String hmacSha256Hex(const String &key, const String &msg) {
 // "hic cihaz yok" (kablo) ile "adres farkli" (modul) ayrimini yapmanin baska
 // yolu yok.
 uint8_t findLcdAddress() {
-  uint8_t found[8];
-  uint8_t count = 0;
+  // SDA hatti takili kalmissa (yanlis kablo, eksik pull-up, 5V modulun hatti
+  // asagi cekmesi) her yoklama zaman asimina kadar bekler. 126 adresi taramak
+  // bu durumda acilisi dakikalarca kilitler ve WiFi'ye hic sira gelmez.
+  // Once hattin saglikli oldugunu dogruluyoruz.
+  pinMode(LCD_SDA, INPUT_PULLUP);
+  pinMode(LCD_SCL, INPUT_PULLUP);
+  bool sdaHigh = digitalRead(LCD_SDA);
+  bool sclHigh = digitalRead(LCD_SCL);
+  Wire.begin(LCD_SDA, LCD_SCL);
 
-  for (uint8_t addr = 1; addr < 127 && count < 8; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) found[count++] = addr;
+  if (!sdaHigh || !sclHigh) {
+    Serial.println("[i2c] Hat mesgul (SDA/SCL asagida). LCD atlaniyor.");
+    Serial.println("[i2c] Kontrol: SDA->D2, SCL->D1, VCC->5V(VIN), GND->GND");
+    return 0;
   }
 
-  Serial.print("[i2c] "); Serial.print(count); Serial.println(" cihaz bulundu.");
-  for (uint8_t i = 0; i < count; i++) {
-    Serial.print("   0x"); Serial.println(found[i], HEX);
-  }
-
-  for (uint8_t i = 0; i < count; i++) {
-    if (found[i] == 0x27 || found[i] == 0x3F) {
-      Serial.print("[lcd] Adres 0x"); Serial.println(found[i], HEX);
-      return found[i];
+  // Yalnizca bilinen iki adresi yokluyoruz. Tam tarama teshis icin daha zengin
+  // ama acilis yolunda; bir ekran icin butun cihazi geciktirmeye degmez.
+  const uint8_t candidates[] = { 0x27, 0x3F };
+  for (uint8_t i = 0; i < 2; i++) {
+    Wire.beginTransmission(candidates[i]);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("[lcd] Adres 0x"); Serial.println(candidates[i], HEX);
+      return candidates[i];
     }
   }
 
-  if (count > 0) {
-    Serial.print("[lcd] Bilinen adres yok, 0x"); Serial.print(found[0], HEX);
-    Serial.println(" deneniyor.");
-    return found[0];
-  }
-
-  Serial.println("[lcd] I2C'de cihaz yok. Kablolari kontrol et: SDA->D2, SCL->D1, VCC->5V(VIN), GND->GND");
+  Serial.println("[lcd] 0x27 ve 0x3F cevap vermedi; ekran olmadan devam ediliyor.");
   return 0;
 }
 
@@ -970,7 +971,7 @@ void setup() {
   EEPROM.begin(EEPROM_SIZE);
   cfgLoad();
 
-  Wire.begin(LCD_SDA, LCD_SCL);
+  // Wire.begin findLcdAddress icinde, hat kontrolunden sonra cagriliyor.
   lcdAddr = findLcdAddress();
   if (lcdAddr) {
     lcd = new LiquidCrystal_I2C(lcdAddr, 16, 2);
