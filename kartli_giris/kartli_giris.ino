@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.13.0"
+#define FIRMWARE_VERSION "0.14.0"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -286,34 +286,43 @@ String hmacSha256Hex(const String &key, const String &msg) {
 // "hic cihaz yok" (kablo) ile "adres farkli" (modul) ayrimini yapmanin baska
 // yolu yok.
 uint8_t findLcdAddress() {
-  // SDA hatti takili kalmissa (yanlis kablo, eksik pull-up, 5V modulun hatti
-  // asagi cekmesi) her yoklama zaman asimina kadar bekler. 126 adresi taramak
-  // bu durumda acilisi dakikalarca kilitler ve WiFi'ye hic sira gelmez.
-  // Once hattin saglikli oldugunu dogruluyoruz.
+  // Hat durumunu TESHIS icin okuyoruz, karar icin degil. Bazi moduller
+  // acilista hatti bir an asagi cekiyor; buna bakip taramayi tumden atlamak
+  // saglam bir ekrani gorunmez yapiyordu.
   pinMode(LCD_SDA, INPUT_PULLUP);
   pinMode(LCD_SCL, INPUT_PULLUP);
-  bool sdaHigh = digitalRead(LCD_SDA);
-  bool sclHigh = digitalRead(LCD_SCL);
+  Serial.print("[i2c] SDA="); Serial.print(digitalRead(LCD_SDA) ? "H" : "L");
+  Serial.print(" SCL="); Serial.println(digitalRead(LCD_SCL) ? "H" : "L");
+
   Wire.begin(LCD_SDA, LCD_SCL);
+  // Uzun/kotu kablolarda 100 kHz, varsayilan 400 kHz'den daha toleransli.
+  Wire.setClock(100000);
 
-  if (!sdaHigh || !sclHigh) {
-    Serial.println("[i2c] Hat mesgul (SDA/SCL asagida). LCD atlaniyor.");
-    Serial.println("[i2c] Kontrol: SDA->D2, SCL->D1, VCC->5V(VIN), GND->GND");
-    return 0;
-  }
-
-  // Yalnizca bilinen iki adresi yokluyoruz. Tam tarama teshis icin daha zengin
-  // ama acilis yolunda; bir ekran icin butun cihazi geciktirmeye degmez.
-  const uint8_t candidates[] = { 0x27, 0x3F };
-  for (uint8_t i = 0; i < 2; i++) {
-    Wire.beginTransmission(candidates[i]);
+  // LCD arka yuzeyleri iki cip ailesinden birini kullanir:
+  //   PCF8574  -> 0x20..0x27
+  //   PCF8574A -> 0x38..0x3F
+  // Yalnizca 0x27 ve 0x3F'e bakmak, A3-A0 jumperlari lehimli modulleri
+  // gormuyordu. Butun adres alanini taramak yerine bu 16 adresi yokluyoruz:
+  // teshis icin yeterince genis, acilisi kilitlemeyecek kadar dar.
+  uint8_t hit = 0;
+  for (uint8_t addr = 0x20; addr <= 0x3F; addr++) {
+    if (addr > 0x27 && addr < 0x38) continue;
+    Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      Serial.print("[lcd] Adres 0x"); Serial.println(candidates[i], HEX);
-      return candidates[i];
+      Serial.print("[i2c] cihaz: 0x"); Serial.println(addr, HEX);
+      if (!hit) hit = addr;
     }
   }
 
-  Serial.println("[lcd] 0x27 ve 0x3F cevap vermedi; ekran olmadan devam ediliyor.");
+  if (hit) {
+    Serial.print("[lcd] Adres 0x"); Serial.println(hit, HEX);
+    return hit;
+  }
+
+  Serial.println("[lcd] I2C'de ekran yok. Kontrol sirasi:");
+  Serial.println("      1) VCC 5V (VIN) pinine bagli mi? 3V3 yetmez.");
+  Serial.println("      2) SDA->D2, SCL->D1, GND ortak mi?");
+  Serial.println("      3) Arka yuzeydeki kontrast potunu cevir.");
   return 0;
 }
 
