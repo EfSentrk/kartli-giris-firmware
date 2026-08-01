@@ -11,7 +11,7 @@
 //   - WiFi + NTP
 //   - Kayit (bootstrap sir) -> cihaz sirri EEPROM'a
 //   - RC522 kart okuma -> HMAC-SHA256 imzali /api/devices/scan
-//   - 16x2 I2C LCD'de sonuc
+//   - 16x2 I2C LCD'de sonuc (adres acilista otomatik bulunur)
 //   - Heartbeat + panel komut kuyrugu (CHECK_UPDATE); araliklar sunucudan
 //   - OTA: hedef surumu panel belirler, binary GitHub'dan iner
 //   - WiFi listesi panelden gonderilebilir (APPLY_SETTINGS)
@@ -20,7 +20,8 @@
 // -----------------------------------------------------------------------------
 // KABLOLAMA (mevcut mimari)
 //   RC522: SDA/SS->D8(GPIO15) SCK->D5 MOSI->D7 MISO->D6 RST->D3(GPIO0) 3.3V GND
-//   LCD  : SDA->D2(GPIO4) SCL->D1(GPIO5) VCC->5V GND  (I2C 0x27, 16x2)
+//   LCD  : SDA->D2(GPIO4) SCL->D1(GPIO5) VCC->5V(VIN) GND  (16x2)
+//   LCD adresi acilista taranir (0x27 / 0x3F); sabit degildir.
 //   NOT: D8->GND 10k pull-down, D3->3V3 10k pull-up (acilis stabilitesi).
 //
 // -----------------------------------------------------------------------------
@@ -54,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.11.0"
+#define FIRMWARE_VERSION "0.12.0"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -79,7 +80,11 @@ static const uint8_t RC522_SS = 15, RC522_RST = 0;   // D8, D3
 MFRC522 rfid(RC522_SS, RC522_RST);
 
 // --- LCD ---
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// LCD adresi SABIT DEGIL: I2C arka yuzeydeki PCF8574 ureticiye gore 0x27 ya
+// da 0x3F adresinde olur. Sabit yazmak, yanlis moduldeki cihazda arka isigin
+// yanip hicbir sey yazmamasina yol aciyordu; acilista veri yolunu tariyoruz.
+static LiquidCrystal_I2C *lcd = nullptr;
+static uint8_t lcdAddr = 0;
 static const uint8_t LCD_SDA = 4, LCD_SCL = 5;       // D2, D1
 
 // --- Zamanlamalar ---
@@ -257,13 +262,53 @@ String hmacSha256Hex(const String &key, const String &msg) {
   return toHex(out, 32);
 }
 
+// I2C veri yolunu tarar ve LCD adresini bulur.
+//
+// Once bilinen iki adresi deniyoruz; bulunamazsa yolda cevap veren ilk cihazi
+// LCD kabul ediyoruz. Tarama sonucu seri porta yaziliyor: ekran calismadiginda
+// "hic cihaz yok" (kablo) ile "adres farkli" (modul) ayrimini yapmanin baska
+// yolu yok.
+uint8_t findLcdAddress() {
+  uint8_t found[8];
+  uint8_t count = 0;
+
+  for (uint8_t addr = 1; addr < 127 && count < 8; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) found[count++] = addr;
+  }
+
+  Serial.print("[i2c] "); Serial.print(count); Serial.println(" cihaz bulundu.");
+  for (uint8_t i = 0; i < count; i++) {
+    Serial.print("   0x"); Serial.println(found[i], HEX);
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    if (found[i] == 0x27 || found[i] == 0x3F) {
+      Serial.print("[lcd] Adres 0x"); Serial.println(found[i], HEX);
+      return found[i];
+    }
+  }
+
+  if (count > 0) {
+    Serial.print("[lcd] Bilinen adres yok, 0x"); Serial.print(found[0], HEX);
+    Serial.println(" deneniyor.");
+    return found[0];
+  }
+
+  Serial.println("[lcd] I2C'de cihaz yok. Kablolari kontrol et: SDA->D2, SCL->D1, VCC->5V(VIN), GND->GND");
+  return 0;
+}
+
 // -----------------------------------------------------------------------------
 // LCD
 // -----------------------------------------------------------------------------
 void lcdShow(const String &l1, const String &l2) {
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print(l1.substring(0, 16));
-  lcd.setCursor(0, 1); lcd.print(l2.substring(0, 16));
+  // Ekran bulunamadiysa cihaz calismaya devam etmeli; kart okuma ve kayit
+  // LCD'ye bagli degil, yalnizca geri bildirim kaybolur.
+  if (!lcd) return;
+  lcd->clear();
+  lcd->setCursor(0, 0); lcd->print(l1.substring(0, 16));
+  lcd->setCursor(0, 1); lcd->print(l2.substring(0, 16));
 }
 // Ikinci satir baglanti durumunu tasiyor: cevrimdisiyken kullanici kart
 // okutmaya devam edebilmeli ama kaydin anlik islenmedigini bilmeli.
@@ -898,7 +943,12 @@ void setup() {
   cfgLoad();
 
   Wire.begin(LCD_SDA, LCD_SCL);
-  lcd.init(); lcd.backlight();
+  lcdAddr = findLcdAddress();
+  if (lcdAddr) {
+    lcd = new LiquidCrystal_I2C(lcdAddr, 16, 2);
+    lcd->init();
+    lcd->backlight();
+  }
   lcdShow("Kartli Giris", FIRMWARE_VERSION);
 
   Serial.println("\n=================================");
