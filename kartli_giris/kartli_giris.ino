@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.18.1"
+#define FIRMWARE_VERSION "0.18.2"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -1095,6 +1095,13 @@ void setup() {
   } else {
     Serial.println("[sir] EEPROM'da mevcut.");
   }
+
+  // Acilista hemen haber ver. Yoksa panel yeni surumu ancak ilk heartbeat
+  // araliginda (varsayilan 5 dakika) goruyordu; OTA'dan sonra cihaz calisir
+  // haldeyken panelde hala eski surum yaziyor ve guncelleme basarisiz sanilir.
+  // Ayni cagri hedef surum bilgisini de getirdigi icin asagidaki OTA
+  // kontrolunun anlamli olmasini da sagliyor.
+  if (strlen(cfg.secret) > 0) pollCommands();
 
   checkOta(false);  // acilista bir kez guncelleme kontrolu
   if (strlen(cfg.secret) > 0) lcdIdle();
