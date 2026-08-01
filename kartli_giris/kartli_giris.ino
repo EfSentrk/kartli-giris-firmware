@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.12.2"
+#define FIRMWARE_VERSION "0.13.0"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -123,6 +123,11 @@ struct Config {
   uint16_t serverPort;
   char     bootstrap[65];
   char     secret[97];   // cihaz sirri (kayittan sonra dolar)
+  // Yuklu firmware'e gomulu fabrika ayarlarinin ozeti. Yeni bir kopya
+  // yuklendiginde (ornegin bir ag eklenmis) bu deger tutmaz ve ayarlar
+  // yeniden uygulanir. Ayni kopya tekrar acildiginda tutar, boylece
+  // panelden gonderilen degisiklikler her acilista ezilmez.
+  uint32_t provisionHash;
 };
 
 static Config cfg;
@@ -132,6 +137,18 @@ static ESP8266WiFiMulti wifiMulti;
 bool cfgValid() {
   for (int i = 0; i < 4; i++) if (cfg.magic[i] != CFG_MAGIC[i]) return false;
   return true;
+}
+
+// FNV-1a: kisa ve carpisma ihtimali bu kullanim icin fazlasiyla dusuk.
+uint32_t provisionHash() {
+  uint32_t h = 2166136261UL;
+  String all = String(PROVISION_WIFI) + "|" + PROVISION_HOST + "|" +
+               String(PROVISION_PORT) + "|" + PROVISION_SECRET;
+  for (size_t i = 0; i < all.length(); i++) {
+    h ^= (uint8_t)all[i];
+    h *= 16777619UL;
+  }
+  return h;
 }
 
 uint8_t wifiCount() {
@@ -425,7 +442,14 @@ void wifiList() {
 
 // Derleme aninda gomulu fabrika ayarlarini EEPROM'a yazar.
 void applyProvisioning() {
+  // Cihaz sirrini KORUYORUZ. Silseydik cihaz yeniden kayit denerdi, sunucu ise
+  // zaten kayitli bir cihaza yeni sir vermiyor; cihaz "panelden sil" ekraninda
+  // takilir ve elle mudahale gerekirdi.
+  char keepSecret[97];
+  memcpy(keepSecret, cfg.secret, sizeof(keepSecret));
+
   memset(&cfg, 0, sizeof(cfg));
+  memcpy(cfg.secret, keepSecret, sizeof(cfg.secret));
 
   String list = PROVISION_WIFI;
   uint8_t slot = 0;
@@ -449,6 +473,7 @@ void applyProvisioning() {
   String(PROVISION_HOST).toCharArray(cfg.serverHost, sizeof(cfg.serverHost));
   cfg.serverPort = PROVISION_PORT;
   String(PROVISION_SECRET).toCharArray(cfg.bootstrap, sizeof(cfg.bootstrap));
+  cfg.provisionHash = provisionHash();
   cfgSave();
 
   Serial.print("[setup] Fabrika ayarlari uygulandi: ");
@@ -989,11 +1014,17 @@ void setup() {
   rfid.PCD_Init();
   bufferInit();
 
-  // Fabrika ayarlari doluysa ve cihazda henuz config yoksa, kurulumu
-  // kendiliginden yapiyoruz. Var olan config'i EZMIYORUZ: sahada SETUP ya da
-  // panelden gonderilen ag listesiyle degistirilmis ayarlar, eski bir fabrika
-  // degerine geri donmemeli.
-  if (!cfgValid() && strlen(PROVISION_HOST) > 0 && strlen(PROVISION_WIFI) > 0) {
+  // Fabrika ayarlari doluysa iki durumda uygulaniyor: cihazda hic config
+  // yoksa, ya da YUKLENEN KOPYA degismisse (ozet tutmuyorsa). Ikincisi
+  // "panelden kodu al, yukle, bitsin" akisini mumkun kiliyor: ag eklediginde
+  // yeni kopyayi yuklemek yetiyor.
+  //
+  // Ayni kopya tekrar acildiginda ozet tuttugu icin hicbir sey yapilmiyor;
+  // boylece panelden gonderilen ag degisiklikleri her acilista ezilmiyor.
+  if (strlen(PROVISION_HOST) > 0 && strlen(PROVISION_WIFI) > 0 &&
+      (!cfgValid() || cfg.provisionHash != provisionHash())) {
+    Serial.println(cfgValid() ? "[setup] Gomulu ayarlar degismis, uygulaniyor."
+                              : "[setup] Config yok, gomulu ayarlar uygulaniyor.");
     applyProvisioning();
   }
 
