@@ -55,7 +55,7 @@
 #include <bearssl/bearssl_hmac.h>
 #include <time.h>
 
-#define FIRMWARE_VERSION "0.17.1"
+#define FIRMWARE_VERSION "0.18.0"
 
 // =============================================================================
 // FABRIKA AYARLARI  (opsiyonel)
@@ -1011,17 +1011,30 @@ void checkOta(bool forced) {
 
   // Sertifika dogrulamasi yok; binary'nin butunlugunu ESPhttpUpdate zaten
   // flash yazarken kontrol ediyor, uydurma bir dosya cihazi acmaz.
+  //
+  // TLS tamponunu KUCULTMUYORUZ. Onceden 1 KB'a cekiliyordu ve el sikisma
+  // sessizce dusuyordu: GitHub release indirmesi objects.githubusercontent.com
+  // adresine yonleniyor, o uc ise MFLN (kucuk TLS parcasi anlasmasi)
+  // desteklemiyor. Desteklemeyen bir sunucuda kucuk tampon, sifrelenmis
+  // parcanin sigmamasi demek. API isteklerinde zaten varsayilan kullaniliyor
+  // ve calisiyor; OTA'nin ondan farkli olmasi icin bir sebep yok.
   WiFiClientSecure client;
   client.setInsecure();
-  client.setBufferSizes(1024, 1024);
 
   ESPhttpUpdate.rebootOnUpdate(true);
   // GitHub asset adresi indirmeyi baska bir konuma yonlendiriyor.
   ESPhttpUpdate.followRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   t_httpUpdate_return ret = ESPhttpUpdate.update(client, targetUrl);
   if (ret == HTTP_UPDATE_FAILED) {
-    Serial.print("[ota] HATA: "); Serial.println(ESPhttpUpdate.getLastErrorString());
+    // Kod ve metni birlikte yaziyoruz: metin cogu zaman "Unknown" cikiyor,
+    // kod ise hatanin TLS mi HTTP mi flash mi oldugunu ayirt ettiriyor.
+    Serial.print("[ota] HATA "); Serial.print(ESPhttpUpdate.getLastError());
+    Serial.print(": "); Serial.println(ESPhttpUpdate.getLastErrorString());
+    Serial.print("[ota] bos heap: "); Serial.println(ESP.getFreeHeap());
+    Serial.print("[ota] bos sketch alani: "); Serial.println(ESP.getFreeSketchSpace());
     lcdShow("OTA HATA", "tekrar denenecek");
+  } else if (ret == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("[ota] Sunucu guncelleme yok dedi.");
   }
   // Basarili olursa cihaz yeniden baslar; buraya donmez.
 }
